@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"D:\\\\BGA_Inspection_Claude\" -Depth 2 | Where-Object { $_.PSIsContainer -eq $false -or $_.PSIsContainer -eq $true } | Select-Object FullName, PSIsContainer | Format-Table -AutoSize)",
+      "PowerShell(Get-ChildItem \"D:\\\\BGA_Inspection_Claude\" -File | Where-Object { $_.Extension -in '.py', '.md', '.txt', '.cfg', '.ini', '.yaml', '.json' } | Select-Object Name, LastWriteTime | Sort-Object LastWriteTime -Descending)"
+    ]
+  }
+}

@@ -1,0 +1,1 @@
+"""BGA void inspection package."""
