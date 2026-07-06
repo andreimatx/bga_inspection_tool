@@ -1,0 +1,8 @@
+image_name,ball_id,center_x,center_y,diameter_px,ball_area_px,void_count,total_void_area_px,largest_void_area_px,void_ratio_percent,largest_void_ratio_percent,quality,is_estimated_pad,confidence
+PCBA-1_BGA_15um_fastscan_View 7.jpg,1,2743,135,78,4778.36,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,2,2741,260,76,4536.46,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,3,2747,385,74,4300.84,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,4,1961,475,86,5808.8,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,5,2747,509,72,4071.5,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,6,1687,1009,62,3019.07,0,0,0,0.0,0.0,PASS,False,1.0
+PCBA-1_BGA_15um_fastscan_View 7.jpg,7,381,1357,90,6361.73,0,0,0,0.0,0.0,PASS,False,1.0

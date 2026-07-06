@@ -1989,6 +1989,14 @@ def _axis_position_sets_for_roi(
             unique_pitches.append(candidate_pitch)
 
     scored_sets: list[tuple[float, tuple[float, ...]]] = []
+    scored_sets.extend(
+        _clustered_axis_position_sets(
+            values=values,
+            line_count=line_count,
+            pitches=unique_pitches,
+            config=config,
+        ),
+    )
     for candidate_pitch in unique_pitches:
         scored_sets.extend(
             _best_axis_position_sets(
@@ -2020,6 +2028,73 @@ def _axis_position_sets_for_roi(
         scored_sets=scored_sets,
         keep=config.final_grid_axis_keep_count,
     )
+
+
+def _clustered_axis_position_sets(
+    values: np.ndarray,
+    line_count: int,
+    pitches: list[float],
+    config: HoughCircleConfig,
+) -> list[tuple[float, tuple[float, ...]]]:
+    """Build NON-uniform line sets directly from candidate coordinate clusters.
+
+    Oblique X-ray views foreshorten one axis, so the real line spacing varies
+    across the package (perspective) and no uniform-pitch series can match
+    every row/column. Clustering the observed pad coordinates recovers the
+    true, gradually changing line positions.
+    """
+    if values.size == 0:
+        return []
+
+    sorted_values = np.sort(values.astype(np.float64))
+    scored_sets: list[tuple[float, tuple[float, ...]]] = []
+
+    for pitch in pitches:
+        if pitch <= 0:
+            continue
+
+        break_gap = max(8.0, pitch * 0.45)
+        clusters: list[list[float]] = [[float(sorted_values[0])]]
+        for value in sorted_values[1:]:
+            if float(value) - clusters[-1][-1] <= break_gap:
+                clusters[-1].append(float(value))
+            else:
+                clusters.append([float(value)])
+
+        strong = [cluster for cluster in clusters if len(cluster) >= 3]
+        if len(strong) < line_count:
+            continue
+
+        positions_all = [float(np.median(cluster)) for cluster in strong]
+        supports = [len(cluster) for cluster in strong]
+
+        # Slide a window of line_count consecutive clusters and keep the
+        # windows with the highest support and plausible spacing.
+        for start in range(0, len(strong) - line_count + 1):
+            window_positions = positions_all[start : start + line_count]
+            gaps = np.diff(window_positions)
+            if np.any(gaps <= 0):
+                continue
+
+            median_gap = float(np.median(gaps))
+            if median_gap <= 0:
+                continue
+            # The window must match the hypothesis pitch scale: without this,
+            # dense junk clusters (vias, traces) form uniformly spaced but
+            # absurdly narrow line sets that outscore the real grid.
+            if median_gap < pitch * 0.65 or median_gap > pitch * 1.45:
+                continue
+            ratios = gaps / median_gap
+            if np.any(ratios < 0.55) or np.any(ratios > 1.80):
+                continue
+
+            positions = tuple(window_positions)
+            score = _axis_position_score(values, positions, median_gap, config)
+            # Small bonus: real cluster lines carry direct support.
+            score += float(sum(supports[start : start + line_count])) * 0.05
+            scored_sets.append((score, positions))
+
+    return scored_sets
 
 
 def _axis_pitch_candidates_from_points(
