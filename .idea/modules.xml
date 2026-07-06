@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/BGA_Inspection_Claude.iml" filepath="$PROJECT_DIR$/.idea/BGA_Inspection_Claude.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/bga_inspection_tool.iml" filepath="$PROJECT_DIR$/.idea/bga_inspection_tool.iml" />
     </modules>
   </component>
 </project>

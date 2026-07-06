@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "PowerShell(Get-ChildItem -Path \"D:\\\\BGA_Inspection_Claude\" -Depth 2 | Where-Object { $_.PSIsContainer -eq $false -or $_.PSIsContainer -eq $true } | Select-Object FullName, PSIsContainer | Format-Table -AutoSize)",
-      "PowerShell(Get-ChildItem \"D:\\\\BGA_Inspection_Claude\" -File | Where-Object { $_.Extension -in '.py', '.md', '.txt', '.cfg', '.ini', '.yaml', '.json' } | Select-Object Name, LastWriteTime | Sort-Object LastWriteTime -Descending)"
+      "PowerShell(Get-ChildItem \"D:\\\\BGA_Inspection_Claude\" -File | Where-Object { $_.Extension -in '.py', '.md', '.txt', '.cfg', '.ini', '.yaml', '.json' } | Select-Object Name, LastWriteTime | Sort-Object LastWriteTime -Descending)",
+      "Bash(python -)",
+      "Bash(py -)",
+      "Bash(py -c \"import cv2; print\\(cv2.__version__\\)\")",
+      "Bash(py -0p)",
+      "Bash(where python3 *)",
+      "Bash(.venv/Scripts/python.exe -c \"import cv2, numpy; print\\(cv2.__version__, numpy.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -)"
     ]
   }
 }

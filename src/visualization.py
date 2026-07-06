@@ -482,14 +482,22 @@ def annotate_detected_balls(
     for ball in balls:
         ratio = ratio_by_ball_id.get(ball.ball_id, 0.0)
 
-        # ROSU daca pica testul, VERDE daca e sub limita
-        color = (0, 0, 255) if ratio >= warning_threshold else (0, 180, 0)
+        # ROSU daca pica testul, PORTOCALIU pentru pad estimat (nesigur),
+        # VERDE daca e sub limita si detectat direct.
+        if ratio >= warning_threshold:
+            color = (0, 0, 255)
+        elif ball.is_estimated:
+            color = (0, 165, 255)
+        else:
+            color = (0, 180, 0)
         center = (ball.center_x, ball.center_y)
 
         cv2.circle(annotated, center, ball.radius, color, thickness=2)
 
-        # Acum afisam si ID-ul bilei SI PROCENTUL de void
-        text = f"#{ball.ball_id}: {ratio:.1f}%"
+        # ID-ul bilei si PROCENTUL de void; '*' marcheaza pad-urile estimate,
+        # unde metrica este mai putin sigura.
+        suffix = "*" if ball.is_estimated else ""
+        text = f"#{ball.ball_id}{suffix}: {ratio:.1f}%"
 
         # Mutam textul deasupra bilei ca sa se vada clar
         cv2.putText(
@@ -527,11 +535,14 @@ def create_void_mask_preview(
     preview = cv2.addWeighted(preview, 1.0, red_overlay, 0.65, 0)
 
     for ball in balls:
+        # Pad-urile estimate (fara evidenta locala directa) sunt portocalii,
+        # ca sa fie evident ca void-urile raportate acolo sunt mai nesigure.
+        color = (0, 165, 255) if ball.is_estimated else (0, 180, 0)
         cv2.circle(
             preview,
             (ball.center_x, ball.center_y),
             ball.radius,
-            (0, 180, 0),
+            color,
             thickness=1,
         )
 

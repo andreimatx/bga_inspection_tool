@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RAW_IMAGES_ROOT = PROJECT_ROOT / "Images_BGA" / "Raw"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -16,7 +17,11 @@ from src.ball_detection import (
     crop_ball_roi,
     detect_solder_balls_with_diagnostics,
 )
-from src.image_loader import list_image_files, load_grayscale
+from src.image_loader import (
+    SUPPORTED_IMAGE_EXTENSIONS,
+    list_image_files,
+    load_grayscale,
+)
 from src.metrics import ComponentFilterConfig, analyze_void_components
 from src.preprocessing import PreprocessingConfig, preprocess_image
 from src.reporting import build_summary, save_reports
@@ -165,6 +170,8 @@ def parse_args() -> argparse.Namespace:
 
     Examples:
         python src/main.py
+        python src/main.py PCBA2_05
+        python src/main.py PCBA1_04,PCBA2_05
         python src/main.py --image Images_BGA/Raw/PCBA2/PCBA2_05.jpg
         python src/main.py --input-dir Images_BGA/Raw/PCBA2
     """
@@ -173,6 +180,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     input_group = parser.add_mutually_exclusive_group(required=False)
+
+    input_group.add_argument(
+        "names",
+        nargs="*",
+        default=[],
+        help=(
+            "Short image name(s) searched under Images_BGA/Raw, e.g. "
+            "'PCBA2_05' or 'PCBA1_04,PCBA2_05' (spaces after commas are fine)."
+        ),
+    )
 
     input_group.add_argument(
         "--image",
@@ -272,19 +289,85 @@ def resolve_path(path: Path) -> Path:
     return path.resolve()
 
 
-def ask_input_path() -> tuple[str, Path]:
-    """Ask for an image or folder path when no CLI input is provided."""
-    print("\nNo input image/folder was provided.")
-    print("Paste the path to an X-ray image or to a folder with images.")
-    print("\nExample image:")
-    print(r"D:\BGA_Inspection_Claude\Images_BGA\Raw\PCBA2\PCBA2_05.jpg")
-    print("\nExample folder:")
-    print(r"D:\BGA_Inspection_Claude\Images_BGA\Raw\PCBA2")
+def list_available_image_names() -> list[str]:
+    """Return all image stems available under Images_BGA/Raw."""
+    if not RAW_IMAGES_ROOT.exists():
+        return []
+
+    return sorted(
+        path.stem
+        for path in RAW_IMAGES_ROOT.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
+
+
+def resolve_named_images(names_spec: str) -> list[Path]:
+    """Resolve short image names like 'PCBA2_05' or 'PCBA1_04,PCBA2_05'.
+
+    Each name is looked up under Images_BGA/Raw/<family>/ first (family =
+    text before the first underscore, e.g. PCBA2), then anywhere under
+    Images_BGA/Raw as a fallback, so new PCBA families work automatically.
+    """
+    names = [name.strip() for name in names_spec.split(",") if name.strip()]
+    if not names:
+        raise ValueError("No image names given.")
+
+    resolved: list[Path] = []
+    missing: list[str] = []
+    for name in names:
+        # Accept 'PCBA2_05.jpg' as well as 'PCBA2_05'.
+        stem = Path(name).stem
+        family = stem.split("_")[0]
+
+        search_dirs = []
+        family_dir = RAW_IMAGES_ROOT / family
+        if family_dir.is_dir():
+            search_dirs.append(family_dir)
+        search_dirs.append(RAW_IMAGES_ROOT)
+
+        match: Path | None = None
+        for directory in search_dirs:
+            candidates = sorted(
+                path
+                for path in directory.rglob("*")
+                if path.is_file()
+                and path.stem.lower() == stem.lower()
+                and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            )
+            if candidates:
+                match = candidates[0]
+                break
+
+        if match is None:
+            missing.append(name)
+        else:
+            resolved.append(match)
+
+    if missing:
+        available = list_available_image_names()
+        hint = ", ".join(available) if available else "(none found)"
+        raise FileNotFoundError(
+            f"Image name(s) not found under {RAW_IMAGES_ROOT}: "
+            f"{', '.join(missing)}. Available: {hint}"
+        )
+
+    return resolved
+
+
+def ask_input_path() -> tuple[str, object]:
+    """Ask for image name(s) or a path when no CLI input is provided."""
+    print("\nNo input was provided.")
+    print("Type one or more image names (they are searched in Images_BGA/Raw),")
+    print("or paste a full path to an image / folder.")
+    print("\nExamples:")
+    print("  PCBA2_05")
+    print("  PCBA1_04,PCBA2_05")
+    print(r"  D:\Projects\bga_inspection_tool\Images_BGA\Raw\PCBA2")
     print("\nType 'q' to quit.\n")
 
     while True:
         try:
-            user_input = input("Input path: ").strip().strip('"').strip("'")
+            user_input = input("Input: ").strip().strip('"').strip("'")
         except (EOFError, KeyboardInterrupt):
             # Ctrl+D / Ctrl+Z / Ctrl+C at the prompt: quit cleanly.
             print("\n[INFO] Cancelled by user.")
@@ -295,8 +378,19 @@ def ask_input_path() -> tuple[str, Path]:
             raise SystemExit(0)
 
         if not user_input:
-            print("[ERROR] Empty path. Please paste an image or folder path.")
+            print("[ERROR] Empty input. Type image name(s) or paste a path.")
             continue
+
+        # Short name(s) first: no path separators means 'PCBA2_05'-style input.
+        looks_like_names = "\\" not in user_input and "/" not in user_input
+        if looks_like_names:
+            try:
+                return "names", resolve_named_images(user_input)
+            except FileNotFoundError as exc:
+                print(f"[ERROR] {exc}")
+                continue
+            except ValueError:
+                pass  # fall through to path handling
 
         try:
             input_path = resolve_path(Path(user_input))
@@ -623,6 +717,9 @@ def inspect_image(
         summary["balls_pass"] = sum(row["quality"] == "PASS" for row in rows)
         summary["balls_review"] = sum(row["quality"] == "REVIEW" for row in rows)
         summary["balls_fail"] = sum(row["quality"] == "FAIL" for row in rows)
+        summary["balls_estimated_pads"] = sum(
+            bool(row["is_estimated_pad"]) for row in rows
+        )
 
         report_paths = save_reports(
             rows=rows,
@@ -643,6 +740,10 @@ def inspect_image(
         print(f"[RESULT] PASS balls: {summary['balls_pass']}")
         print(f"[RESULT] REVIEW balls: {summary['balls_review']}")
         print(f"[RESULT] FAIL balls: {summary['balls_fail']}")
+        print(
+            "[RESULT] Estimated pads (metrics less reliable): "
+            f"{summary['balls_estimated_pads']}"
+        )
         print(f"[RESULT] Qualitative verdict: {verdict}")
 
         print("\n[OUTPUT] Processed images:")
@@ -687,9 +788,31 @@ def inspect_folder(
     if not image_paths:
         raise RuntimeError(f"No supported images found in: {input_dir}")
 
-    total = len(image_paths)
-    print(f"\n[INFO] Found {total} image(s) in: {input_dir}")
+    print(f"\n[INFO] Found {len(image_paths)} image(s) in: {input_dir}")
+    inspect_image_batch(
+        image_paths=image_paths,
+        output_root=output_root,
+        mask_library_root=mask_library_root,
+        warning_threshold=warning_threshold,
+        fail_threshold=fail_threshold,
+        largest_void_fail_threshold=largest_void_fail_threshold,
+        progress_mode=progress_mode,
+        debug=debug,
+    )
 
+
+def inspect_image_batch(
+    image_paths: list[Path],
+    output_root: Path,
+    mask_library_root: Path,
+    warning_threshold: float,
+    fail_threshold: float,
+    largest_void_fail_threshold: float,
+    progress_mode: str = "auto",
+    debug: bool = False,
+) -> None:
+    """Run inspection for a list of images, continuing past per-image errors."""
+    total = len(image_paths)
     succeeded = 0
     failures: list[tuple[Path, Exception]] = []
 
@@ -735,19 +858,43 @@ def _print_error(title: str, exc: BaseException, debug: bool) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
-    """Resolve the input and dispatch to single-image or folder inspection."""
+    """Resolve the input and dispatch to name, single-image or folder mode."""
     validate_thresholds(args)
 
     image_path = args.image
     input_dir = args.input_dir
+    named_paths: list[Path] | None = None
 
-    if image_path is None and input_dir is None:
-        input_type, selected_path = ask_input_path()
+    if args.names:
+        # Join CLI tokens so 'PCBA1_04, PCBA2_05' (split by the shell into
+        # two arguments) behaves exactly like 'PCBA1_04,PCBA2_05'.
+        named_paths = resolve_named_images(",".join(args.names))
+
+    if image_path is None and input_dir is None and named_paths is None:
+        input_type, selected = ask_input_path()
 
         if input_type == "image":
-            image_path = selected_path
+            image_path = selected
+        elif input_type == "names":
+            named_paths = selected
         else:
-            input_dir = selected_path
+            input_dir = selected
+
+    if named_paths is not None:
+        print(f"\n[INFO] Selected {len(named_paths)} image(s):")
+        for path in named_paths:
+            print(f"       - {path.relative_to(RAW_IMAGES_ROOT)}")
+        inspect_image_batch(
+            image_paths=named_paths,
+            output_root=args.output_root,
+            mask_library_root=args.mask_library_root,
+            warning_threshold=args.warning_threshold,
+            fail_threshold=args.fail_threshold,
+            largest_void_fail_threshold=args.largest_void_fail_threshold,
+            progress_mode=args.progress,
+            debug=args.debug,
+        )
+        return
 
     if image_path is not None:
         inspect_image(

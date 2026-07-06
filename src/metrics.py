@@ -45,6 +45,39 @@ class ComponentFilterConfig:
     max_hard_rim_fraction: float = 0.40
     max_angular_span_degrees: float = 155.0
 
+    # Rim crescent rejection: components that are radially THIN but span a
+    # wide angle at the outer part of the ball are rim reflections, not voids.
+    # A real round void with such an angular span would need to be much
+    # thicker radially, so these three conditions cannot match real voids.
+    rim_arc_min_mean_distance_ratio: float = 0.55
+    rim_arc_max_thickness_ratio: float = 0.25
+    rim_arc_min_angular_span_degrees: float = 35.0
+
+    # Board-bright rejection: a candidate whose mean gray level reaches the
+    # bare-board level (sampled from the crop corners, outside the ball) is
+    # exposed laminate, not a void: missing solder still leaves the copper
+    # pad in the X-ray path, so a real void can never be as bright as bare
+    # laminate. Two reference levels are used:
+    # - OUTER components (board bleeding in from the rim on off-center
+    #   detections) are compared against the corner MEDIAN.
+    # - CENTRAL components are compared against a HIGH percentile of the
+    #   corners. The median would be dragged down when a dark structure
+    #   (component on the other board side) overlaps the corners, wrongly
+    #   rejecting real bright voids; the high percentile always tracks the
+    #   brightest laminate actually present.
+    board_bright_margin: float = 10.0
+    board_bright_min_distance_ratio: float = 0.60
+    board_bright_center_percentile: float = 80.0
+    board_sample_min_pixels: int = 30
+    board_sample_radius_ratio: float = 1.02
+
+    # Empty-pad guard: a real solder ball always has a core much darker than
+    # the surrounding board. When the ROI core is at board level, the
+    # detection landed on bare board (edge-of-grid placement error), so every
+    # candidate is judged against the board MEDIAN, not just outer ones.
+    empty_pad_core_radius_ratio: float = 0.45
+    empty_pad_core_margin: float = 10.0
+
 
 @dataclass(frozen=True)
 class VoidMetrics:
@@ -68,6 +101,9 @@ class _ComponentFeatures:
     outer_fraction: float
     hard_rim_fraction: float
     angular_span_degrees: float
+    mean_distance_ratio: float
+    radial_thickness_ratio: float
+    mean_intensity: float | None
 
 
 def analyze_void_components(
@@ -97,6 +133,22 @@ def analyze_void_components(
     yy, xx = np.indices(mask.shape)
     distances = np.hypot(xx - center_x, yy - center_y)
 
+    board_level = _estimate_board_level(
+        roi=roi,
+        distances=distances,
+        estimated_radius=estimated_radius,
+        config=config,
+    )
+    empty_pad = _is_empty_pad(
+        roi=roi,
+        distances=distances,
+        estimated_radius=estimated_radius,
+        board_level=board_level,
+        config=config,
+    )
+    if empty_pad:
+        _log_rejection(rejection_log, "empty_pad(core at board level)")
+
     min_area = max(
         config.min_void_area,
         int(round(ball_area * config.min_void_area_ratio)),
@@ -115,6 +167,7 @@ def analyze_void_components(
             estimated_radius=estimated_radius,
             center_x=center_x,
             center_y=center_y,
+            roi=roi,
         )
 
         if features.area < min_area:
@@ -139,6 +192,27 @@ def analyze_void_components(
                 f"outer={features.outer_fraction:.2f}, "
                 f"hard={features.hard_rim_fraction:.2f}, "
                 f"span={features.angular_span_degrees:.1f})",
+            )
+            continue
+
+        if _looks_like_rim_crescent(features, config):
+            _log_rejection(
+                rejection_log,
+                "rim_crescent("
+                f"mean_dist={features.mean_distance_ratio:.2f}, "
+                f"thickness={features.radial_thickness_ratio:.2f}, "
+                f"span={features.angular_span_degrees:.1f})",
+            )
+            continue
+
+        if _looks_like_bare_board(features, board_level, config, empty_pad=empty_pad):
+            _log_rejection(
+                rejection_log,
+                "bare_board("
+                f"intensity={features.mean_intensity:.1f}, "
+                f"board_median={board_level[0]:.1f}, "
+                f"board_bright={board_level[1]:.1f}, "
+                f"mean_dist={features.mean_distance_ratio:.2f})",
             )
             continue
 
@@ -191,6 +265,7 @@ def _component_features(
     estimated_radius: float,
     center_x: float,
     center_y: float,
+    roi: np.ndarray | None = None,
 ) -> _ComponentFeatures:
     """Compute geometry features for one connected component."""
     area = int(stats[cv2.CC_STAT_AREA])
@@ -207,6 +282,8 @@ def _component_features(
     if component_distances.size == 0:
         outer_fraction = 1.0
         hard_rim_fraction = 1.0
+        mean_distance_ratio = 1.0
+        radial_thickness_ratio = 0.0
     else:
         outer_fraction = float(
             np.count_nonzero(component_distances >= estimated_radius * 0.70),
@@ -214,6 +291,18 @@ def _component_features(
         hard_rim_fraction = float(
             np.count_nonzero(component_distances >= estimated_radius * 0.84),
         ) / float(component_distances.size)
+        mean_distance_ratio = float(
+            np.mean(component_distances) / estimated_radius,
+        )
+        radial_thickness_ratio = float(
+            (
+                np.percentile(component_distances, 95)
+                - np.percentile(component_distances, 5)
+            )
+            / estimated_radius,
+        )
+
+    mean_intensity = float(np.mean(roi[component])) if roi is not None else None
 
     angular_span = _angular_span_degrees(component, center_x, center_y)
 
@@ -227,6 +316,9 @@ def _component_features(
         outer_fraction=outer_fraction,
         hard_rim_fraction=hard_rim_fraction,
         angular_span_degrees=angular_span,
+        mean_distance_ratio=mean_distance_ratio,
+        radial_thickness_ratio=radial_thickness_ratio,
+        mean_intensity=mean_intensity,
     )
 
 
@@ -301,6 +393,92 @@ def _looks_like_arc_or_line(
         return True
 
     return False
+
+
+def _estimate_board_level(
+    roi: np.ndarray | None,
+    distances: np.ndarray,
+    estimated_radius: float,
+    config: ComponentFilterConfig,
+) -> tuple[float, float] | None:
+    """Estimate bare-board gray levels from crop corners outside the ball.
+
+    Returns (median, high percentile). The median is representative when the
+    corners are mostly laminate; the high percentile stays correct even when
+    a dark structure on the other board side covers part of the corners.
+    """
+    if roi is None or roi.shape[:2] != distances.shape:
+        return None
+
+    outside = roi[distances >= estimated_radius * config.board_sample_radius_ratio]
+    if outside.size < config.board_sample_min_pixels:
+        return None
+
+    return (
+        float(np.median(outside)),
+        float(np.percentile(outside, config.board_bright_center_percentile)),
+    )
+
+
+def _looks_like_rim_crescent(
+    features: _ComponentFeatures,
+    config: ComponentFilterConfig,
+) -> bool:
+    """Reject radially thin, angularly wide arcs hugging the ball rim.
+
+    A real round void with this angular span would need a radial thickness
+    far above the limit, so the three combined conditions are geometrically
+    impossible for genuine voids.
+    """
+    return (
+        features.mean_distance_ratio >= config.rim_arc_min_mean_distance_ratio
+        and features.radial_thickness_ratio <= config.rim_arc_max_thickness_ratio
+        and features.angular_span_degrees >= config.rim_arc_min_angular_span_degrees
+    )
+
+
+def _is_empty_pad(
+    roi: np.ndarray | None,
+    distances: np.ndarray,
+    estimated_radius: float,
+    board_level: tuple[float, float] | None,
+    config: ComponentFilterConfig,
+) -> bool:
+    """Return True when the ROI core is as bright as the board (no ball)."""
+    if roi is None or board_level is None or roi.shape[:2] != distances.shape:
+        return False
+
+    core = roi[distances <= estimated_radius * config.empty_pad_core_radius_ratio]
+    if core.size == 0:
+        return False
+
+    board_median, _ = board_level
+    return float(core.mean()) >= board_median - config.empty_pad_core_margin
+
+
+def _looks_like_bare_board(
+    features: _ComponentFeatures,
+    board_level: tuple[float, float] | None,
+    config: ComponentFilterConfig,
+    empty_pad: bool = False,
+) -> bool:
+    """Reject candidates as bright as the bare board (exposed laminate).
+
+    Outer components are compared against the corner median (board bleeding
+    in from the rim). Central components are compared against the brightest
+    laminate level so real voids over dark board structures survive. On an
+    empty pad (no ball under the detection) the median applies everywhere.
+    """
+    if board_level is None or features.mean_intensity is None:
+        return False
+
+    board_median, board_bright = board_level
+    if empty_pad or features.mean_distance_ratio >= config.board_bright_min_distance_ratio:
+        reference = board_median
+    else:
+        reference = board_bright
+
+    return features.mean_intensity >= reference - config.board_bright_margin
 
 
 def _component_circularity(component_mask: np.ndarray, area: int) -> float:

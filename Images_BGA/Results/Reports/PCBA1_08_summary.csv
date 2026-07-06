@@ -1,0 +1,2 @@
+image_name,total_balls,average_void_ratio_percent,maximum_void_ratio_percent,balls_over_warning_threshold,warning_threshold_percent,qualitative_verdict,fail_threshold_percent,largest_void_fail_threshold_percent,balls_pass,balls_review,balls_fail,balls_estimated_pads
+PCBA1_08.jpg,256,1.4914,11.5498,0,15.0,PASS,25.0,12.0,256,0,0,0

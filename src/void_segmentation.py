@@ -63,6 +63,16 @@ class VoidSegmentationConfig:
     draw_radius_scale: float = 1.00
     max_candidates_per_ball: int = 15
 
+    # Bond-wire / trace suppression.
+    # Dark thin lines (bond wires, traces) crossing a ball pull the median
+    # background down, so the bright gaps BETWEEN the lines show up as false
+    # void stripes. A grayscale morphological closing fills the thin dark
+    # lines BEFORE the median background is computed, so the background
+    # follows the true ball level. The residual is still computed on the
+    # ORIGINAL smoothed image, so real void shapes are never altered.
+    suppress_wires: bool = True
+    wire_close_kernel_size: int = 7  # must exceed the wire width in pixels
+
 
 def segment_voids(
     roi: np.ndarray,
@@ -99,7 +109,22 @@ def segment_voids(
     if k_size % 2 == 0:
         k_size += 1 # Ensure odd
 
-    bg = cv2.medianBlur(smoothed, k_size)
+    # 2b. BOND-WIRE SUPPRESSION (wire-proof background)
+    # Fill thin dark lines (bond wires / traces) with a grayscale closing
+    # before computing the median background. The gaps between wires then
+    # match the background level, so they no longer appear as bright stripes.
+    # Real voids are BRIGHT structures and are untouched by the closing.
+    if config.suppress_wires:
+        close_size = max(3, config.wire_close_kernel_size) | 1
+        kernel_close = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (close_size, close_size),
+        )
+        background_base = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, kernel_close)
+    else:
+        background_base = smoothed
+
+    bg = cv2.medianBlur(background_base, k_size)
 
     # 3. SUBTRACTION (Original - Background)
     # Voids will stand out as bright values, normal ball texture will be near 0
