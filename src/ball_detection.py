@@ -548,37 +548,23 @@ def detect_solder_balls_with_diagnostics(
             pitch_anisotropy >= config.post_snap_min_pitch_anisotropy
         )
 
-    if grid_is_anisotropic and final_grid is not None and len(balls) > 1:
-        # Sheared assignments can put two real candidates in one grid cell
-        # (ball + via); drop the lighter one before empty slots are filled.
-        balls = _drop_overlapping_grid_balls(
-            image=image,
-            balls=balls,
-            grid=final_grid,
-            expected_slots=expected_slots,
-        )
-
     # Fill grid slots not covered by any detected ball (nearest-slot assignment)
     if final_grid is not None and final_pitch is not None and len(balls) < expected_slots:
         grid_xs = final_grid.x_positions
         grid_ys = final_grid.y_positions
         occupied_slots: set[tuple[int, int]] = set()
+        fill_centers: list[tuple[int, int]] | None = None
         if grid_is_anisotropic:
             # Oblique views shear ball positions away from the axis-aligned
-            # slot centers, so nearest-slot mapping can pile two balls onto
-            # one slot and report a neighbouring occupied slot as empty.
-            # A slot counts as occupied when any ball sits within its cell.
-            window_x = final_grid.pitch_x * 0.62
-            window_y = final_grid.pitch_y * 0.62
-            for row, gy in enumerate(grid_ys):
-                for col, gx in enumerate(grid_xs):
-                    for b in balls:
-                        if (
-                            abs(b.center_x - gx) <= window_x
-                            and abs(b.center_y - gy) <= window_y
-                        ):
-                            occupied_slots.add((row, col))
-                            break
+            # slot centers, so nearest-slot occupancy mapping is unreliable.
+            # The affine/homography stage already reports each unconfirmed
+            # slot with its projected coordinates — fill exactly those, so
+            # every physical pad keeps its own marker even when neighbouring
+            # evidence overlaps.
+            fill_centers = [
+                (position.center_x, position.center_y)
+                for position in missing_positions
+            ][: expected_slots - len(balls)]
         else:
             for b in balls:
                 col = min(range(len(grid_xs)), key=lambda i, bx=b.center_x: abs(grid_xs[i] - bx))
@@ -588,37 +574,42 @@ def detect_solder_balls_with_diagnostics(
         seed_r = max(8, int(round(final_pitch * config.roi_pad_radius_seed_pitch_ratio)))
         r_min = int(round(final_pitch * config.roi_pad_radius_min_pitch_ratio))
         r_max = int(round(final_pitch * config.roi_pad_radius_max_pitch_ratio))
-        for row_idx, gy in enumerate(grid_ys):
-            for col_idx, gx in enumerate(grid_xs):
-                if (row_idx, col_idx) in occupied_slots:
-                    continue
-                cx, cy = int(round(gx)), int(round(gy))
-                r = _estimate_pad_radius(image, cx, cy, seed_r, config)
-                r = max(r_min, min(r, r_max))
-                ball_is_estimated = True
-                if config.use_local_component_final_snap:
-                    snapped_cx, snapped_cy, snapped_r = _snap_pad_center_to_local_component(
-                        image=image,
-                        x=cx,
-                        y=cy,
-                        radius=r,
-                        pitch=final_pitch,
-                        config=config,
-                    )
-                    if snapped_cx != cx or snapped_cy != cy:
-                        cx, cy, r = snapped_cx, snapped_cy, snapped_r
-                        ball_is_estimated = False
-                balls.append(
-                    SolderBall(
-                        ball_id=next_id,
-                        center_x=cx,
-                        center_y=cy,
-                        radius=r,
-                        confidence=0.20 if ball_is_estimated else 0.65,
-                        is_estimated=ball_is_estimated,
-                    )
+        if fill_centers is not None:
+            fill_targets = fill_centers
+        else:
+            fill_targets = [
+                (int(round(gx)), int(round(gy)))
+                for row_idx, gy in enumerate(grid_ys)
+                for col_idx, gx in enumerate(grid_xs)
+                if (row_idx, col_idx) not in occupied_slots
+            ]
+        for cx, cy in fill_targets:
+            r = _estimate_pad_radius(image, cx, cy, seed_r, config)
+            r = max(r_min, min(r, r_max))
+            ball_is_estimated = True
+            if config.use_local_component_final_snap:
+                snapped_cx, snapped_cy, snapped_r = _snap_pad_center_to_local_component(
+                    image=image,
+                    x=cx,
+                    y=cy,
+                    radius=r,
+                    pitch=final_pitch,
+                    config=config,
                 )
-                next_id += 1
+                if snapped_cx != cx or snapped_cy != cy:
+                    cx, cy, r = snapped_cx, snapped_cy, snapped_r
+                    ball_is_estimated = False
+            balls.append(
+                SolderBall(
+                    ball_id=next_id,
+                    center_x=cx,
+                    center_y=cy,
+                    radius=r,
+                    confidence=0.20 if ball_is_estimated else 0.65,
+                    is_estimated=ball_is_estimated,
+                )
+            )
+            next_id += 1
 
     # Post-assembly per-pad refinement: refine ALL ball positions (real + estimated)
     # using local dark-blob search WITHOUT re-running dedup. Fixes slightly off-center
@@ -659,56 +650,6 @@ def detect_solder_balls_with_diagnostics(
         expected_grid_slots=expected_slots,
     )
     return BallDetectionResult(balls=balls, diagnostics=diagnostics)
-
-
-def _drop_overlapping_grid_balls(
-    image: np.ndarray,
-    balls: list[SolderBall],
-    grid: _BgaGridFit,
-    expected_slots: int,
-) -> list[SolderBall]:
-    """Drop balls sharing one grid cell, preferring real and darker (pad-like) ones."""
-    height, width = image.shape[:2]
-
-    def core_intensity(ball: SolderBall) -> float:
-        half = max(3, ball.radius // 2)
-        x0 = max(0, ball.center_x - half)
-        y0 = max(0, ball.center_y - half)
-        x1 = min(width, ball.center_x + half + 1)
-        y1 = min(height, ball.center_y + half + 1)
-        if x1 <= x0 or y1 <= y0:
-            return 255.0
-        return float(np.mean(image[y0:y1, x0:x1]))
-
-    threshold_x = grid.pitch_x * 0.55
-    threshold_y = grid.pitch_y * 0.55
-    ordered = sorted(
-        balls,
-        key=lambda ball: (ball.is_estimated, core_intensity(ball)),
-    )
-    kept: list[SolderBall] = []
-    for ball in ordered:
-        overlaps = any(
-            abs(ball.center_x - other.center_x) < threshold_x
-            and abs(ball.center_y - other.center_y) < threshold_y
-            for other in kept
-        )
-        if not overlaps:
-            kept.append(ball)
-
-    kept = kept[:expected_slots]
-    kept.sort(key=lambda ball: (ball.center_y, ball.center_x))
-    return [
-        SolderBall(
-            ball_id=index + 1,
-            center_x=ball.center_x,
-            center_y=ball.center_y,
-            radius=ball.radius,
-            confidence=ball.confidence,
-            is_estimated=ball.is_estimated,
-        )
-        for index, ball in enumerate(kept)
-    ]
 
 
 def _post_refine_ball_positions(
@@ -1622,6 +1563,28 @@ def _regularize_candidates_on_affine_grid(
     if len(assigned_candidates) < int(round(expected_slots * 0.70)):
         return None
 
+    refined_centers = _refine_affine_centers_with_homography(
+        assigned_candidates=assigned_candidates,
+        expected_centers=expected_centers,
+        assigned_slots=assigned_slots,
+        roi=roi,
+        pitch=affine_pitch,
+        config=config,
+    )
+    if refined_centers is not None:
+        refined_assigned, refined_slots = _assign_candidates_to_affine_slots(
+            image=image,
+            candidates=candidates,
+            expected_centers=refined_centers,
+            roi=roi,
+            pitch=affine_pitch,
+            config=config,
+        )
+        if len(refined_assigned) >= len(assigned_candidates):
+            expected_centers = refined_centers
+            assigned_candidates = refined_assigned
+            assigned_slots = refined_slots
+
     recovered_candidates = _recover_affine_slot_local_pad_candidates(
         image=image,
         roi=roi,
@@ -1643,13 +1606,60 @@ def _regularize_candidates_on_affine_grid(
             allow_grid_evidence=True,
         )
 
+    merged_candidates = _merge_pad_candidates(assigned_candidates, config)
+
+    # Cell-level dedup with slot accounting: sheared assignments can leave
+    # two candidates inside one grid cell (ball + via shadow). Keep the
+    # stronger one and release the losing slot so it is reported (and later
+    # filled) as missing instead of silently dropping a pad from the grid.
+    threshold_x = float(np.linalg.norm(vector_x)) * 0.55
+    threshold_y = float(np.linalg.norm(vector_y)) * 0.55
+    deduped_candidates: list[_PadCandidate] = []
+    dropped_candidates: list[_PadCandidate] = []
+    for candidate in sorted(
+        merged_candidates,
+        key=lambda item: item.score,
+        reverse=True,
+    ):
+        clash = any(
+            abs(candidate.x - kept.x) < threshold_x
+            and abs(candidate.y - kept.y) < threshold_y
+            for kept in deduped_candidates
+        )
+        if clash:
+            dropped_candidates.append(candidate)
+        else:
+            deduped_candidates.append(candidate)
+    dropped_candidates.extend(
+        candidate
+        for candidate in assigned_candidates
+        if (candidate.x, candidate.y)
+        not in {(kept.x, kept.y) for kept in merged_candidates}
+    )
+    if dropped_candidates:
+        slot_items = [
+            (slot, center)
+            for slot, center in expected_centers.items()
+            if slot in assigned_slots
+        ]
+        for candidate in dropped_candidates:
+            dropped_slot, _center = min(
+                slot_items,
+                key=lambda item: (candidate.x - item[1][0]) ** 2
+                + (candidate.y - item[1][1]) ** 2,
+            )
+            assigned_slots.discard(dropped_slot)
+    merged_candidates = sorted(
+        deduped_candidates,
+        key=lambda item: (item.y, item.x),
+    )
     missing_positions = _missing_positions_from_affine_slots(
         expected_centers=expected_centers,
         assigned_slots=assigned_slots,
         config=config,
     )
     return (
-        _merge_pad_candidates(assigned_candidates, config),
+        merged_candidates,
         missing_positions,
         affine_pitch,
     )
@@ -1671,6 +1681,78 @@ def _affine_grid_centers(
             if not _roi_contains_point(roi, x, y):
                 continue
             centers[(row, column)] = (x, y)
+    return centers
+
+
+def _refine_affine_centers_with_homography(
+    assigned_candidates: list[_PadCandidate],
+    expected_centers: dict[tuple[int, int], tuple[int, int]],
+    assigned_slots: set[tuple[int, int]],
+    roi: RoiBounds,
+    pitch: float,
+    config: HoughCircleConfig,
+) -> dict[tuple[int, int], tuple[int, int]] | None:
+    """Re-project the 16x16 slots through a perspective (homography) fit.
+
+    The affine fit absorbs the linear part of an oblique view, but true
+    perspective bends the grid non-linearly, so the residual error peaks in
+    the corners. A homography is the exact model for a planar grid under
+    perspective, so slots re-projected through it land on the corner pads.
+    """
+    expected_slots = config.expected_grid_rows * config.expected_grid_cols
+    slot_centers = [
+        (slot, center)
+        for slot, center in expected_centers.items()
+        if slot in assigned_slots
+    ]
+    if not slot_centers:
+        return None
+
+    max_pair_distance = pitch * 0.60
+    src_points: list[tuple[float, float]] = []
+    dst_points: list[tuple[float, float]] = []
+    for candidate in assigned_candidates:
+        (row, column), (center_x, center_y) = min(
+            slot_centers,
+            key=lambda item: (candidate.x - item[1][0]) ** 2
+            + (candidate.y - item[1][1]) ** 2,
+        )
+        if np.hypot(candidate.x - center_x, candidate.y - center_y) > max_pair_distance:
+            continue
+        src_points.append((float(column), float(row)))
+        dst_points.append((float(candidate.x), float(candidate.y)))
+
+    if len(src_points) < int(round(expected_slots * 0.55)):
+        return None
+
+    homography, inlier_mask = cv2.findHomography(
+        np.array(src_points, dtype=np.float32),
+        np.array(dst_points, dtype=np.float32),
+        cv2.RANSAC,
+        max(4.0, pitch * 0.15),
+        maxIters=5000,
+        confidence=0.998,
+    )
+    if homography is None or inlier_mask is None:
+        return None
+    if int(np.count_nonzero(inlier_mask)) < int(round(len(src_points) * 0.80)):
+        return None
+
+    centers: dict[tuple[int, int], tuple[int, int]] = {}
+    for row in range(config.expected_grid_rows):
+        for column in range(config.expected_grid_cols):
+            source = np.array([float(column), float(row), 1.0], dtype=np.float64)
+            projected = homography @ source
+            if abs(projected[2]) < 1e-9:
+                return None
+            x = int(round(float(projected[0] / projected[2])))
+            y = int(round(float(projected[1] / projected[2])))
+            if not _roi_contains_point(roi, x, y):
+                continue
+            centers[(row, column)] = (x, y)
+
+    if len(centers) != expected_slots:
+        return None
     return centers
 
 
