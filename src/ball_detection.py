@@ -178,6 +178,7 @@ class HoughCircleConfig:
     # local snap is enabled automatically for such views. Straight views
     # (pitch ratio ~1.0) keep their exact grid positions.
     auto_post_snap_anisotropic_grids: bool = True
+    auto_affine_anisotropic_grids: bool = True
     post_snap_min_pitch_anisotropy: float = 1.12
     bga_roi_bottom_shrink_pitch: float = 0.0
     bga_roi_top_shrink_pitch: float = 0.0   # positive=shrink top down, negative=expand top up
@@ -533,15 +534,56 @@ def detect_solder_balls_with_diagnostics(
         config=config,
     )
 
+    grid_is_anisotropic = False
+    if (
+        final_grid is not None
+        and final_grid.pitch_x > 0
+        and final_grid.pitch_y > 0
+    ):
+        pitch_anisotropy = max(final_grid.pitch_x, final_grid.pitch_y) / min(
+            final_grid.pitch_x,
+            final_grid.pitch_y,
+        )
+        grid_is_anisotropic = (
+            pitch_anisotropy >= config.post_snap_min_pitch_anisotropy
+        )
+
+    if grid_is_anisotropic and final_grid is not None and len(balls) > 1:
+        # Sheared assignments can put two real candidates in one grid cell
+        # (ball + via); drop the lighter one before empty slots are filled.
+        balls = _drop_overlapping_grid_balls(
+            image=image,
+            balls=balls,
+            grid=final_grid,
+            expected_slots=expected_slots,
+        )
+
     # Fill grid slots not covered by any detected ball (nearest-slot assignment)
     if final_grid is not None and final_pitch is not None and len(balls) < expected_slots:
         grid_xs = final_grid.x_positions
         grid_ys = final_grid.y_positions
         occupied_slots: set[tuple[int, int]] = set()
-        for b in balls:
-            col = min(range(len(grid_xs)), key=lambda i, bx=b.center_x: abs(grid_xs[i] - bx))
-            row = min(range(len(grid_ys)), key=lambda j, by=b.center_y: abs(grid_ys[j] - by))
-            occupied_slots.add((row, col))
+        if grid_is_anisotropic:
+            # Oblique views shear ball positions away from the axis-aligned
+            # slot centers, so nearest-slot mapping can pile two balls onto
+            # one slot and report a neighbouring occupied slot as empty.
+            # A slot counts as occupied when any ball sits within its cell.
+            window_x = final_grid.pitch_x * 0.62
+            window_y = final_grid.pitch_y * 0.62
+            for row, gy in enumerate(grid_ys):
+                for col, gx in enumerate(grid_xs):
+                    for b in balls:
+                        if (
+                            abs(b.center_x - gx) <= window_x
+                            and abs(b.center_y - gy) <= window_y
+                        ):
+                            occupied_slots.add((row, col))
+                            break
+        else:
+            for b in balls:
+                col = min(range(len(grid_xs)), key=lambda i, bx=b.center_x: abs(grid_xs[i] - bx))
+                row = min(range(len(grid_ys)), key=lambda j, by=b.center_y: abs(grid_ys[j] - by))
+                occupied_slots.add((row, col))
         next_id = len(balls) + 1
         seed_r = max(8, int(round(final_pitch * config.roi_pad_radius_seed_pitch_ratio)))
         r_min = int(round(final_pitch * config.roi_pad_radius_min_pitch_ratio))
@@ -582,19 +624,9 @@ def detect_solder_balls_with_diagnostics(
     # using local dark-blob search WITHOUT re-running dedup. Fixes slightly off-center
     # circles without causing detection merging.
     # Uses ROI-masked image so post_refine never snaps to structures outside the BGA square.
-    apply_post_snap = config.use_post_refine_local_snap
-    if (
-        not apply_post_snap
-        and config.auto_post_snap_anisotropic_grids
-        and final_grid is not None
-        and final_grid.pitch_x > 0
-        and final_grid.pitch_y > 0
-    ):
-        pitch_anisotropy = max(final_grid.pitch_x, final_grid.pitch_y) / min(
-            final_grid.pitch_x,
-            final_grid.pitch_y,
-        )
-        apply_post_snap = pitch_anisotropy >= config.post_snap_min_pitch_anisotropy
+    apply_post_snap = config.use_post_refine_local_snap or (
+        config.auto_post_snap_anisotropic_grids and grid_is_anisotropic
+    )
     if apply_post_snap and final_pitch is not None:
         if roi is not None:
             refine_image = image.copy()
@@ -629,6 +661,56 @@ def detect_solder_balls_with_diagnostics(
     return BallDetectionResult(balls=balls, diagnostics=diagnostics)
 
 
+def _drop_overlapping_grid_balls(
+    image: np.ndarray,
+    balls: list[SolderBall],
+    grid: _BgaGridFit,
+    expected_slots: int,
+) -> list[SolderBall]:
+    """Drop balls sharing one grid cell, preferring real and darker (pad-like) ones."""
+    height, width = image.shape[:2]
+
+    def core_intensity(ball: SolderBall) -> float:
+        half = max(3, ball.radius // 2)
+        x0 = max(0, ball.center_x - half)
+        y0 = max(0, ball.center_y - half)
+        x1 = min(width, ball.center_x + half + 1)
+        y1 = min(height, ball.center_y + half + 1)
+        if x1 <= x0 or y1 <= y0:
+            return 255.0
+        return float(np.mean(image[y0:y1, x0:x1]))
+
+    threshold_x = grid.pitch_x * 0.55
+    threshold_y = grid.pitch_y * 0.55
+    ordered = sorted(
+        balls,
+        key=lambda ball: (ball.is_estimated, core_intensity(ball)),
+    )
+    kept: list[SolderBall] = []
+    for ball in ordered:
+        overlaps = any(
+            abs(ball.center_x - other.center_x) < threshold_x
+            and abs(ball.center_y - other.center_y) < threshold_y
+            for other in kept
+        )
+        if not overlaps:
+            kept.append(ball)
+
+    kept = kept[:expected_slots]
+    kept.sort(key=lambda ball: (ball.center_y, ball.center_x))
+    return [
+        SolderBall(
+            ball_id=index + 1,
+            center_x=ball.center_x,
+            center_y=ball.center_y,
+            radius=ball.radius,
+            confidence=ball.confidence,
+            is_estimated=ball.is_estimated,
+        )
+        for index, ball in enumerate(kept)
+    ]
+
+
 def _post_refine_ball_positions(
     image: np.ndarray,
     balls: list[SolderBall],
@@ -643,8 +725,9 @@ def _post_refine_ball_positions(
     """
     from dataclasses import replace as dc_replace
 
+    min_separation = pitch * 0.45
     refined: list[SolderBall] = []
-    for ball in balls:
+    for index, ball in enumerate(balls):
         snapped_cx, snapped_cy, snapped_r = _snap_pad_center_to_local_component(
             image=image,
             x=ball.center_x,
@@ -653,6 +736,19 @@ def _post_refine_ball_positions(
             pitch=pitch,
             config=config,
         )
+        if snapped_cx != ball.center_x or snapped_cy != ball.center_y:
+            # Reject snaps that converge onto another ball's position:
+            # each grid slot must keep exactly one detection.
+            others = [
+                (b.center_x, b.center_y)
+                for b in (*refined, *balls[index + 1 :])
+            ]
+            if any(
+                np.hypot(snapped_cx - ox, snapped_cy - oy) < min_separation
+                for ox, oy in others
+            ):
+                refined.append(ball)
+                continue
         if snapped_cx != ball.center_x or snapped_cy != ball.center_y:
             refined.append(
                 dc_replace(
@@ -1361,7 +1457,21 @@ def _regularize_final_candidates_on_roi_grid(
     if len(assignments) < min_assignments:
         return assignment_pool, [], pitch, None
 
-    if config.use_affine_final_grid:
+    use_affine = config.use_affine_final_grid
+    if (
+        not use_affine
+        and config.auto_affine_anisotropic_grids
+        and grid.pitch_x > 0
+        and grid.pitch_y > 0
+    ):
+        # Oblique views shear the grid (columns lean with row), which an
+        # axis-aligned grid cannot follow; the affine model can.
+        grid_anisotropy = max(grid.pitch_x, grid.pitch_y) / min(
+            grid.pitch_x,
+            grid.pitch_y,
+        )
+        use_affine = grid_anisotropy >= config.post_snap_min_pitch_anisotropy
+    if use_affine:
         affine_result = _regularize_candidates_on_affine_grid(
             image=image,
             candidates=assignment_pool,
