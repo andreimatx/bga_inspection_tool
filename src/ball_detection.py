@@ -173,6 +173,12 @@ class HoughCircleConfig:
     use_affine_final_grid: bool = False
     use_local_component_final_snap: bool = False
     use_post_refine_local_snap: bool = False
+    # Oblique X-ray views foreshorten one axis (pitch_x != pitch_y) and make
+    # every ball drift slightly against the fitted grid, so the per-ball
+    # local snap is enabled automatically for such views. Straight views
+    # (pitch ratio ~1.0) keep their exact grid positions.
+    auto_post_snap_anisotropic_grids: bool = True
+    post_snap_min_pitch_anisotropy: float = 1.12
     bga_roi_bottom_shrink_pitch: float = 0.0
     bga_roi_top_shrink_pitch: float = 0.0   # positive=shrink top down, negative=expand top up
     bga_roi_left_shrink_pitch: float = 0.0  # shrink left edge inward
@@ -576,7 +582,20 @@ def detect_solder_balls_with_diagnostics(
     # using local dark-blob search WITHOUT re-running dedup. Fixes slightly off-center
     # circles without causing detection merging.
     # Uses ROI-masked image so post_refine never snaps to structures outside the BGA square.
-    if config.use_post_refine_local_snap and final_pitch is not None:
+    apply_post_snap = config.use_post_refine_local_snap
+    if (
+        not apply_post_snap
+        and config.auto_post_snap_anisotropic_grids
+        and final_grid is not None
+        and final_grid.pitch_x > 0
+        and final_grid.pitch_y > 0
+    ):
+        pitch_anisotropy = max(final_grid.pitch_x, final_grid.pitch_y) / min(
+            final_grid.pitch_x,
+            final_grid.pitch_y,
+        )
+        apply_post_snap = pitch_anisotropy >= config.post_snap_min_pitch_anisotropy
+    if apply_post_snap and final_pitch is not None:
         if roi is not None:
             refine_image = image.copy()
             h_img, w_img = image.shape[:2]
