@@ -172,7 +172,11 @@ class HoughCircleConfig:
     snap_final_candidates_to_grid: bool = False
     use_affine_final_grid: bool = False
     use_local_component_final_snap: bool = False
-    use_post_refine_local_snap: bool = False
+    # Per-ball local snap after grid assembly. Safe on straight views too:
+    # the snap only accepts a move when the local dark-component evidence is
+    # at least as strong as at the current position (never degrades), and an
+    # anti-convergence guard keeps one detection per pad.
+    use_post_refine_local_snap: bool = True
     # Oblique X-ray views foreshorten one axis (pitch_x != pitch_y) and make
     # every ball drift slightly against the fitted grid, so the per-ball
     # local snap is enabled automatically for such views. Straight views
@@ -618,6 +622,10 @@ def detect_solder_balls_with_diagnostics(
     apply_post_snap = config.use_post_refine_local_snap or (
         config.auto_post_snap_anisotropic_grids and grid_is_anisotropic
     )
+    # Straight views already place almost every circle correctly, and the
+    # local-evidence score can be fooled by dense trace bundles, so there the
+    # snap only rescues clearly mis-placed circles (weak current evidence).
+    post_snap_rescue_only = not grid_is_anisotropic
     if apply_post_snap and final_pitch is not None:
         if roi is not None:
             refine_image = image.copy()
@@ -632,7 +640,13 @@ def detect_solder_balls_with_diagnostics(
                 refine_image[:, roi.x_max :] = 128
         else:
             refine_image = image
-        balls = _post_refine_ball_positions(refine_image, balls, final_pitch, config)
+        balls = _post_refine_ball_positions(
+            refine_image,
+            balls,
+            final_pitch,
+            config,
+            rescue_only=post_snap_rescue_only,
+        )
 
     final_circles = {candidate.circle for candidate in final_candidates}
     rejected_candidates = _rejected_real_candidates(
@@ -657,6 +671,7 @@ def _post_refine_ball_positions(
     balls: list[SolderBall],
     pitch: float,
     config: HoughCircleConfig,
+    rescue_only: bool = False,
 ) -> list[SolderBall]:
     """Refine every ball center to the nearest local dark blob — no dedup, no count change.
 
@@ -667,8 +682,35 @@ def _post_refine_ball_positions(
     from dataclasses import replace as dc_replace
 
     min_separation = pitch * 0.45
+    rescue_threshold = 0.0
+    original_scores: list[float] = []
+    if rescue_only:
+        original_scores = [
+            _grid_slot_evidence_score(
+                image=image,
+                x=ball.center_x,
+                y=ball.center_y,
+                radius=ball.radius,
+            )
+            for ball in balls
+        ]
+        # A mis-placed circle (via ring, trace bundle) still scores fairly
+        # high in absolute terms, so "suspect" is defined relative to how
+        # this image's correctly placed circles score.
+        median_score = float(np.median(original_scores)) if original_scores else 0.0
+        rescue_threshold = float(np.clip(median_score - 0.12, 0.30, 0.85))
     refined: list[SolderBall] = []
     for index, ball in enumerate(balls):
+        original_score: float | None = None
+        if rescue_only:
+            original_score = original_scores[index]
+            if original_score >= rescue_threshold:
+                refined.append(ball)
+                continue
+        other_positions = [
+            (b.center_x, b.center_y)
+            for b in (*refined, *balls[index + 1 :])
+        ]
         snapped_cx, snapped_cy, snapped_r = _snap_pad_center_to_local_component(
             image=image,
             x=ball.center_x,
@@ -676,17 +718,31 @@ def _post_refine_ball_positions(
             radius=ball.radius,
             pitch=pitch,
             config=config,
+            forbidden_points=other_positions,
+            min_separation=min_separation,
         )
+        if (
+            rescue_only
+            and (snapped_cx != ball.center_x or snapped_cy != ball.center_y)
+        ):
+            snapped_score = _grid_slot_evidence_score(
+                image=image,
+                x=snapped_cx,
+                y=snapped_cy,
+                radius=snapped_r,
+            )
+            if snapped_score < (original_score or 0.0) + 0.15:
+                snapped_cx, snapped_cy, snapped_r = (
+                    ball.center_x,
+                    ball.center_y,
+                    ball.radius,
+                )
         if snapped_cx != ball.center_x or snapped_cy != ball.center_y:
             # Reject snaps that converge onto another ball's position:
             # each grid slot must keep exactly one detection.
-            others = [
-                (b.center_x, b.center_y)
-                for b in (*refined, *balls[index + 1 :])
-            ]
             if any(
                 np.hypot(snapped_cx - ox, snapped_cy - oy) < min_separation
-                for ox, oy in others
+                for ox, oy in other_positions
             ):
                 refined.append(ball)
                 continue
@@ -3749,6 +3805,8 @@ def _snap_pad_center_to_local_component(
     radius: int,
     pitch: float,
     config: HoughCircleConfig,
+    forbidden_points: list[tuple[int, int]] | None = None,
+    min_separation: float = 0.0,
 ) -> tuple[int, int, int]:
     """Move a grid slot onto the closest dark pad component in its local crop."""
     height, width = image.shape[:2]
@@ -3853,6 +3911,16 @@ def _snap_pad_center_to_local_component(
         offset = float(np.hypot(center_x - x, center_y - y))
         if offset > max_offset:
             continue
+        if forbidden_points and min_separation > 0.0:
+            # Skip components already claimed by another ball, so the snap
+            # falls through to the next-best FREE pad component instead of
+            # being rejected wholesale by the convergence guard.
+            taken = any(
+                np.hypot(center_x - fx, center_y - fy) < min_separation
+                for fx, fy in forbidden_points
+            )
+            if taken:
+                continue
 
         candidate_radius = int(round(np.sqrt(effective_area / pi)))
         candidate_radius = max(min_radius, min(candidate_radius, max_radius))

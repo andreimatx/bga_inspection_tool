@@ -174,7 +174,24 @@ def segment_voids(
             if aspect_ratio > config.max_aspect_ratio_small or circularity < config.min_circularity_small:
                 continue
 
-        # Desenează void-ul validat (folosim conturul exact, nu un cerc aproximativ)
-        cv2.drawContours(final_mask, [cnt], -1, 255, thickness=-1)
+        # Void-urile fizice sunt bule sferice de gaz, deci pe imagine apar ca
+        # discuri luminoase. Conturul brut din threshold e zdrentuit (marginile
+        # bulei se estompeaza gradual), asa ca montam un cerc exact pe
+        # componenta si il desenam DOAR daca umple rezonabil cercul montat —
+        # altfel pastram conturul brut (structuri reale ne-circulare).
+        (fit_x, fit_y), fit_radius = cv2.minEnclosingCircle(cnt)
+        fit_area = np.pi * (fit_radius ** 2)
+        fill_fraction = area / max(1.0, fit_area)
+        max_fit_radius = radius * config.max_void_radius_ratio * 1.6
+        if fill_fraction >= 0.45 and fit_radius <= max_fit_radius:
+            cv2.circle(
+                final_mask,
+                (int(round(fit_x)), int(round(fit_y))),
+                max(config.min_void_radius_px, int(round(fit_radius))),
+                255,
+                thickness=-1,
+            )
+        else:
+            cv2.drawContours(final_mask, [cnt], -1, 255, thickness=-1)
 
     return final_mask
