@@ -3754,8 +3754,8 @@ def _snap_pad_center_to_local_component(
     height, width = image.shape[:2]
     min_radius = int(round(pitch * config.roi_pad_radius_min_pitch_ratio))
     max_radius = int(round(pitch * config.roi_pad_radius_max_pitch_ratio))
-    max_offset = max(10.0, pitch * 0.55)
-    search_radius = int(round(max(radius * 1.9, pitch * 0.62)))
+    max_offset = max(10.0, pitch * 0.62)
+    search_radius = int(round(max(radius * 1.9, pitch * 0.68)))
     x0 = max(0, x - search_radius)
     y0 = max(0, y - search_radius)
     x1 = min(width - 1, x + search_radius)
@@ -3798,7 +3798,11 @@ def _snap_pad_center_to_local_component(
 
     expected_area = pi * (radius**2)
     min_area = expected_area * 0.16
-    max_area = expected_area * 1.45
+    # Parallax in oblique views doubles a pad with the shadow of the pad on
+    # the other board side, so the merged dark blob can reach ~2x the pad
+    # area; such blobs are still valid snap targets (handled below by using
+    # the dark-core centroid instead of the full-blob centroid).
+    max_area = expected_area * 2.30
     original_score = _grid_slot_evidence_score(image, x, y, radius)
     best: tuple[float, int, int, int, float] | None = None
 
@@ -3830,11 +3834,27 @@ def _snap_pad_center_to_local_component(
 
         center_x = int(round(x0 + (moments["m10"] / moments["m00"])))
         center_y = int(round(y0 + (moments["m01"] / moments["m00"])))
+        effective_area = area
+        if area > expected_area * 1.30:
+            # Oversized blob = pad merged with a parallax shadow. Recenter on
+            # the darkest core inside the blob (the actual solder pad) rather
+            # than the centroid of the merged shape.
+            contour_mask = np.zeros(crop.shape, dtype=np.uint8)
+            cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+            core_threshold = max(40.0, float(otsu_threshold) - 12.0)
+            core_mask = (blurred <= core_threshold) & (contour_mask > 0)
+            core_ys, core_xs = np.nonzero(core_mask)
+            if core_ys.size >= max(9.0, min_area * 0.5):
+                center_x = int(round(x0 + float(np.mean(core_xs))))
+                center_y = int(round(y0 + float(np.mean(core_ys))))
+                effective_area = float(
+                    min(core_ys.size, expected_area),
+                )
         offset = float(np.hypot(center_x - x, center_y - y))
         if offset > max_offset:
             continue
 
-        candidate_radius = int(round(np.sqrt(area / pi)))
+        candidate_radius = int(round(np.sqrt(effective_area / pi)))
         candidate_radius = max(min_radius, min(candidate_radius, max_radius))
         evidence_score = _grid_slot_evidence_score(
             image=image,
@@ -3842,7 +3862,10 @@ def _snap_pad_center_to_local_component(
             y=center_y,
             radius=max(candidate_radius, min_radius),
         )
-        if evidence_score < max(0.34, original_score - 0.18):
+        # Never trade evidence away: a snap that lands on a weaker dark
+        # component than the current position corrupts the void measurement
+        # (bright board area inside the circle reads as a false void).
+        if evidence_score < max(0.34, original_score - 0.02):
             continue
 
         metrics = _dark_component_geometry_metrics(
