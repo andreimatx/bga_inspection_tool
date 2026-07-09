@@ -1,0 +1,9 @@
+image_name,ball_id,center_x,center_y,diameter_px,ball_area_px,void_count,total_void_area_px,largest_void_area_px,void_ratio_percent,largest_void_ratio_percent,quality,is_estimated_pad,confidence,largest_void_diameter_percent,ipc_assessment
+PCBA_TEMPLATE.jpg,1,500,400,60,2827.43,0,0,0,0.0,0.0,PASS,False,0.95,0.0,ACCEPTABLE
+PCBA_TEMPLATE.jpg,2,620,400,60,2827.43,2,52,34,1.85,1.2,PASS,False,0.95,10.97,ACCEPTABLE
+PCBA_TEMPLATE.jpg,3,740,400,60,2827.43,2,127,59,4.5,2.1,PASS,False,0.95,14.45,ACCEPTABLE
+PCBA_TEMPLATE.jpg,4,860,400,60,2827.43,2,247,153,8.75,5.4,PASS,False,0.95,23.26,ACCEPTABLE
+PCBA_TEMPLATE.jpg,5,980,400,60,2827.43,2,373,223,13.2,7.9,REVIEW,False,0.95,28.08,PROCESS INDICATOR
+PCBA_TEMPLATE.jpg,6,1100,400,60,2827.43,2,526,399,18.6,14.1,REVIEW,False,0.95,37.57,PROCESS INDICATOR
+PCBA_TEMPLATE.jpg,7,1220,400,60,2827.43,2,775,594,27.4,21.0,FAIL,False,0.95,45.84,DEFECT (IPC-A-610)
+PCBA_TEMPLATE.jpg,8,1340,400,60,2827.43,2,65,31,2.3,1.1,PASS,True,0.0,10.47,ACCEPTABLE

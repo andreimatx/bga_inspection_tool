@@ -37,10 +37,10 @@ from src.void_segmentation import VoidSegmentationConfig, segment_voids  # noqa:
 
 BASELINE_PATH = PROJECT_ROOT / "tools" / "regression_baseline.json"
 
-# Thresholds mirror the src/main.py CLI defaults.
-WARNING_THRESHOLD = 15.0
+# Thresholds mirror the src/main.py CLI defaults (IPC-A-610 / IPC-7095).
+WARNING_THRESHOLD = 10.0
 FAIL_THRESHOLD = 25.0
-LARGEST_VOID_FAIL_THRESHOLD = 12.0
+LARGEST_VOID_FAIL_THRESHOLD = 12.25
 
 # Comparison tolerances.
 AVG_RATIO_TOLERANCE = 0.30       # percentage points on the image average

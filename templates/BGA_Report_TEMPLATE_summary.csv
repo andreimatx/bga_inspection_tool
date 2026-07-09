@@ -1,0 +1,2 @@
+image_name,total_balls,average_void_ratio_percent,maximum_void_ratio_percent,median_void_ratio_percent,max_single_void_ratio_percent,balls_over_warning_threshold,warning_threshold_percent,ipc_a610_defect_balls,ipc_7095_process_indicator_balls,ipc_verdict,standards_applied
+PCBA_TEMPLATE.jpg,8,9.575,27.4,8.75,21.0,3,10.0,1,2,REJECT,IPC-A-610 / IPC-7095

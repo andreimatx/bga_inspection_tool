@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -220,22 +221,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warning-threshold",
         type=float,
-        default=15.0,
-        help="Void ratio percent above which a ball is marked as REVIEW.",
+        default=10.0,
+        help=(
+            "Void ratio percent above which a ball is marked as REVIEW "
+            "(process indicator per IPC-7095 guidance; default 10)."
+        ),
     )
 
     parser.add_argument(
         "--fail-threshold",
         type=float,
         default=25.0,
-        help="Void ratio percent above which a ball is marked as FAIL.",
+        help=(
+            "Void ratio percent above which a ball is a DEFECT/FAIL "
+            "(IPC-A-610 criterion for Class 1, 2 and 3; default 25)."
+        ),
     )
 
     parser.add_argument(
         "--largest-void-fail-threshold",
         type=float,
-        default=12.0,
-        help="Largest single void ratio above which a ball is marked as FAIL.",
+        default=12.25,
+        help=(
+            "Largest single void area percent above which a ball is marked "
+            "REVIEW (dominant void ~35%% of ball diameter; default 12.25)."
+        ),
+    )
+
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help=(
+            "Parallel worker processes for batch runs: 0 = auto (one per "
+            "image, capped at CPU count - 1), 1 = sequential. Results are "
+            "identical to a sequential run; only wall time changes."
+        ),
     )
 
     parser.add_argument(
@@ -418,14 +439,19 @@ def classify_ball_quality(
     fail_threshold: float,
     largest_void_fail_threshold: float,
 ) -> str:
-    """Classify one solder ball based on total and largest void ratio."""
+    """Classify one solder ball following IPC-A-610 / IPC-7095.
+
+    FAIL (defect) only above the IPC-A-610 cumulative-area limit (25%).
+    A dominant single void or a total in the 10-25% band is a process
+    indicator (REVIEW) per IPC-7095 guidance, not a defect.
+    """
     if void_ratio_percent >= fail_threshold:
         return "FAIL"
 
-    if largest_void_ratio_percent >= largest_void_fail_threshold:
-        return "FAIL"
-
     if void_ratio_percent >= warning_threshold:
+        return "REVIEW"
+
+    if largest_void_ratio_percent >= largest_void_fail_threshold:
         return "REVIEW"
 
     return "PASS"
@@ -500,6 +526,7 @@ def inspect_image(
 
     progress = ProgressBar(label=image_stem, total=100.0, mode=progress_mode)
     progress.set_progress(0, "Starting")
+    started_at = time.perf_counter()
 
     try:
         # --- Output folders -------------------------------------------------
@@ -721,11 +748,28 @@ def inspect_image(
             bool(row["is_estimated_pad"]) for row in rows
         )
 
+        report_context = {
+            "image_path": str(image_path),
+            "image_width": int(raw.shape[1]),
+            "image_height": int(raw.shape[0]),
+            "expected_slots": diagnostics.expected_grid_slots,
+            "occupied_slots": diagnostics.occupied_grid_slots,
+            "warning_threshold": warning_threshold,
+            "fail_threshold": fail_threshold,
+            "largest_void_review_threshold": largest_void_fail_threshold,
+            "preview_image": folders["processed"]
+            / f"{image_stem}_06_void_preview.jpg",
+            "contours_image": folders["processed"]
+            / f"{image_stem}_04_pad_contours.jpg",
+            "processing_seconds": time.perf_counter() - started_at,
+        }
+
         report_paths = save_reports(
             rows=rows,
             summary=summary,
             output_dir=folders["reports"],
             image_stem=image_stem,
+            context=report_context,
         )
 
         progress.set_progress(100, "Inspection complete")
@@ -745,6 +789,7 @@ def inspect_image(
             f"{summary['balls_estimated_pads']}"
         )
         print(f"[RESULT] Qualitative verdict: {verdict}")
+        print(f"[RESULT] IPC verdict: {summary.get('ipc_verdict', 'N/A')}")
 
         print("\n[OUTPUT] Processed images:")
         print(f"         {folders['processed']}")
@@ -757,6 +802,7 @@ def inspect_image(
         print("[OUTPUT] Reports:")
         print(f"         {folders['reports']}")
         print(f"[OUTPUT] Excel report: {report_paths['excel']}")
+        print(f"[OUTPUT] Word report:  {report_paths['word']}")
     finally:
         # If we exited via an exception, finish() never ran: erase the partial
         # bar so the error message starts on a clean line.
@@ -772,6 +818,7 @@ def inspect_folder(
     largest_void_fail_threshold: float,
     progress_mode: str = "auto",
     debug: bool = False,
+    jobs: int = 1,
 ) -> None:
     """Run inspection for all supported images in a folder.
 
@@ -798,7 +845,104 @@ def inspect_folder(
         largest_void_fail_threshold=largest_void_fail_threshold,
         progress_mode=progress_mode,
         debug=debug,
+        jobs=jobs,
     )
+
+
+def _batch_worker(args: tuple) -> tuple[str, str, str | None]:
+    """Run one image inspection in a worker process, capturing its output.
+
+    Returns (image_name, captured_stdout, error_message_or_None). Top-level
+    so Windows 'spawn' multiprocessing can pickle it.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    (
+        image_path,
+        output_root,
+        mask_library_root,
+        warning_threshold,
+        fail_threshold,
+        largest_void_fail_threshold,
+    ) = args
+
+    buffer = io.StringIO()
+    error: str | None = None
+    try:
+        with redirect_stdout(buffer):
+            inspect_image(
+                image_path=image_path,
+                output_root=output_root,
+                mask_library_root=mask_library_root,
+                warning_threshold=warning_threshold,
+                fail_threshold=fail_threshold,
+                largest_void_fail_threshold=largest_void_fail_threshold,
+                progress_mode="off",
+            )
+    except Exception as exc:  # noqa: BLE001 - reported to the parent process
+        error = str(exc)
+    return (Path(image_path).name, buffer.getvalue(), error)
+
+
+def _run_batch_parallel(
+    image_paths: list[Path],
+    output_root: Path,
+    mask_library_root: Path,
+    warning_threshold: float,
+    fail_threshold: float,
+    largest_void_fail_threshold: float,
+    jobs: int,
+) -> tuple[int, list[tuple[Path, Exception]]]:
+    """Process independent images in parallel worker processes.
+
+    Per-image results are byte-identical to a sequential run; only the wall
+    time changes. Each worker's console output is buffered and printed as a
+    whole block so logs never interleave.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    tasks = [
+        (
+            path,
+            output_root,
+            mask_library_root,
+            warning_threshold,
+            fail_threshold,
+            largest_void_fail_threshold,
+        )
+        for path in image_paths
+    ]
+
+    succeeded = 0
+    failures: list[tuple[Path, Exception]] = []
+    done = 0
+    total = len(image_paths)
+
+    print(f"[INFO] Running {total} image(s) on {jobs} parallel workers...")
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(_batch_worker, task): task[0] for task in tasks
+        }
+        for future in as_completed(futures):
+            image_path = futures[future]
+            done += 1
+            try:
+                name, output, error = future.result()
+            except Exception as exc:  # noqa: BLE001 - worker crashed hard
+                failures.append((image_path, exc))
+                print(f"[ERROR] ({done}/{total}) '{image_path.name}': {exc}")
+                continue
+
+            print(f"\n[INFO] ----- Completed {done}/{total}: {name} -----")
+            print(output, end="")
+            if error is None:
+                succeeded += 1
+            else:
+                failures.append((image_path, RuntimeError(error)))
+                print(f"[ERROR] Skipped '{name}': {error}")
+
+    return succeeded, failures
 
 
 def inspect_image_batch(
@@ -810,11 +954,37 @@ def inspect_image_batch(
     largest_void_fail_threshold: float,
     progress_mode: str = "auto",
     debug: bool = False,
+    jobs: int = 1,
 ) -> None:
     """Run inspection for a list of images, continuing past per-image errors."""
     total = len(image_paths)
     succeeded = 0
     failures: list[tuple[Path, Exception]] = []
+
+    import os
+
+    if jobs == 0:
+        jobs = max(1, min(total, (os.cpu_count() or 2) - 1))
+    if jobs > 1 and total > 1:
+        succeeded, failures = _run_batch_parallel(
+            image_paths=image_paths,
+            output_root=output_root,
+            mask_library_root=mask_library_root,
+            warning_threshold=warning_threshold,
+            fail_threshold=fail_threshold,
+            largest_void_fail_threshold=largest_void_fail_threshold,
+            jobs=min(jobs, total),
+        )
+        print("\n" + "=" * 80)
+        print(
+            f"[BATCH] Completed: {succeeded}/{total} image(s) processed successfully."
+        )
+        if failures:
+            print(f"[BATCH] Failed: {len(failures)} image(s):")
+            for path, exc in failures:
+                print(f"        - {path.name}: {exc}")
+        print("=" * 80)
+        return
 
     for index, image_path in enumerate(image_paths, start=1):
         print(f"\n[INFO] ----- Image {index}/{total} -----")
@@ -893,6 +1063,7 @@ def _run(args: argparse.Namespace) -> None:
             largest_void_fail_threshold=args.largest_void_fail_threshold,
             progress_mode=args.progress,
             debug=args.debug,
+            jobs=args.jobs,
         )
         return
 
@@ -918,6 +1089,7 @@ def _run(args: argparse.Namespace) -> None:
             largest_void_fail_threshold=args.largest_void_fail_threshold,
             progress_mode=args.progress,
             debug=args.debug,
+            jobs=args.jobs,
         )
         return
 
