@@ -295,19 +295,6 @@ class _BgaRoiEstimate:
     source: str
 
 
-def detect_solder_balls(
-    image: np.ndarray,
-    config: HoughCircleConfig,
-) -> list[SolderBall]:
-    """Detect BGA solder balls, preferring the fitted 16x16 package grid."""
-    if config.use_bga_grid_roi:
-        result = detect_solder_balls_with_diagnostics(image, config)
-        if result.balls:
-            return result.balls
-
-    return _detect_hough_solder_balls(image, config)
-
-
 def detect_solder_balls_with_diagnostics(
     image: np.ndarray,
     config: HoughCircleConfig,
@@ -925,16 +912,45 @@ def _merge_pad_candidates(
     candidates: list[_PadCandidate],
     config: HoughCircleConfig,
 ) -> list[_PadCandidate]:
-    """Merge duplicate local detections while keeping the strongest evidence."""
+    """Merge duplicate local detections while keeping the strongest evidence.
+
+    Spatial-hash accelerated but EXACTLY equivalent to the original O(n^2)
+    scan: for each candidate (processed in the same score order) the match
+    is still the lowest-index existing entry within the same distance
+    threshold, computed with the same arithmetic. A qualifying pair is
+    always within max(6, candidate.radius * factor) pixels because the
+    threshold uses min(candidate.radius, existing.radius), so searching the
+    surrounding hash cells can never miss a match the full scan would find.
+    """
     merged: list[_PadCandidate] = []
     ordered = sorted(
         candidates,
         key=lambda item: (item.score, item.radius),
         reverse=True,
     )
+
+    cell_size = 48.0
+    grid: dict[tuple[int, int], list[int]] = {}
+
+    def cell_of(px: float, py: float) -> tuple[int, int]:
+        return (int(px // cell_size), int(py // cell_size))
+
     for candidate in ordered:
+        search_radius = max(
+            6.0,
+            candidate.radius * config.duplicate_distance_factor,
+        )
+        cx_min, cy_min = cell_of(candidate.x - search_radius, candidate.y - search_radius)
+        cx_max, cy_max = cell_of(candidate.x + search_radius, candidate.y + search_radius)
+        nearby: list[int] = []
+        for cell_x in range(cx_min, cx_max + 1):
+            for cell_y in range(cy_min, cy_max + 1):
+                nearby.extend(grid.get((cell_x, cell_y), ()))
+        nearby.sort()
+
         duplicate_index = None
-        for index, existing in enumerate(merged):
+        for index in nearby:
+            existing = merged[index]
             distance = float(np.hypot(candidate.x - existing.x, candidate.y - existing.y))
             threshold = (
                 min(candidate.radius, existing.radius)
@@ -946,11 +962,18 @@ def _merge_pad_candidates(
 
         if duplicate_index is None:
             merged.append(candidate)
+            new_index = len(merged) - 1
+            grid.setdefault(cell_of(candidate.x, candidate.y), []).append(new_index)
             continue
 
         existing = merged[duplicate_index]
         if candidate.score > existing.score:
             merged[duplicate_index] = candidate
+            old_cell = cell_of(existing.x, existing.y)
+            new_cell = cell_of(candidate.x, candidate.y)
+            if old_cell != new_cell:
+                grid[old_cell].remove(duplicate_index)
+                grid.setdefault(new_cell, []).append(duplicate_index)
 
     return sorted(merged, key=lambda item: (item.y, item.x))
 
@@ -2467,20 +2490,6 @@ def _deduplicate_axis_position_sets(
     return unique
 
 
-def _edge_assignment_count(
-    assignments: dict[tuple[int, int], int],
-    config: HoughCircleConfig,
-) -> int:
-    """Count assignments on the outer rows and columns."""
-    last_row = config.expected_grid_rows - 1
-    last_column = config.expected_grid_cols - 1
-    return sum(
-        1
-        for row, column in assignments
-        if row in (0, last_row) or column in (0, last_column)
-    )
-
-
 def _axis_grid_line_balance_penalty(
     candidates: list[tuple[int, int, int]],
     grid: _BgaGridFit,
@@ -2619,40 +2628,6 @@ def _refine_final_axis_grid(
         )
 
     return refined
-
-
-def _stabilize_axis_positions(
-    positions: list[float],
-    fallback_pitch: float,
-    config: HoughCircleConfig,
-) -> list[float]:
-    """Prevent refined grid axes from collapsing onto neighboring rows/columns."""
-    if len(positions) < 2 or fallback_pitch <= 0.0:
-        return positions
-
-    gaps = np.diff(np.array(positions, dtype=np.float32))
-    positive_gaps = gaps[gaps > 0]
-    if positive_gaps.size == 0:
-        return positions
-
-    pitch_candidates = positive_gaps[
-        (positive_gaps >= fallback_pitch * 0.55)
-        & (positive_gaps <= fallback_pitch * 1.45)
-    ]
-    reference_pitch = (
-        float(np.median(pitch_candidates))
-        if pitch_candidates.size
-        else fallback_pitch
-    )
-    min_gap = reference_pitch * config.final_grid_axis_min_gap_ratio
-    max_gap = reference_pitch * config.final_grid_axis_max_gap_ratio
-    if np.all((gaps >= min_gap) & (gaps <= max_gap)):
-        return positions
-
-    indexes = np.arange(len(positions), dtype=np.float32)
-    starts = np.array(positions, dtype=np.float32) - (indexes * reference_pitch)
-    start = float(np.median(starts))
-    return [start + (index * reference_pitch) for index in range(len(positions))]
 
 
 def _pad_candidates_from_axis_grid_assignments(
@@ -4145,66 +4120,6 @@ def _rejected_real_candidates(
     return rejected
 
 
-def _detect_bga_roi_candidates(
-    image: np.ndarray,
-    config: HoughCircleConfig,
-) -> list[tuple[int, int, int]]:
-    """Detect broad circle candidates for locating the dense BGA grid ROI."""
-    height, width = image.shape[:2]
-    scale = min(1.0, config.roi_detection_max_dimension / max(height, width))
-    if scale < 1.0:
-        small = cv2.resize(
-            image,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        small = image
-
-    circles = cv2.HoughCircles(
-        small,
-        cv2.HOUGH_GRADIENT,
-        dp=config.dp,
-        minDist=config.roi_candidate_min_dist_scaled,
-        param1=config.param1,
-        param2=config.roi_candidate_param2,
-        minRadius=config.roi_candidate_min_radius_scaled,
-        maxRadius=config.roi_candidate_max_radius_scaled,
-    )
-    if circles is None:
-        return []
-
-    candidates: list[tuple[int, int, int]] = []
-    for x, y, radius in np.round(circles[0]).astype(int):
-        if (
-            x - radius < 0
-            or y - radius < 0
-            or x + radius >= small.shape[1]
-            or y + radius >= small.shape[0]
-        ):
-            continue
-        if not _has_scaled_candidate_evidence(
-            image=small,
-            x=int(x),
-            y=int(y),
-            radius=int(radius),
-            config=config,
-        ):
-            continue
-
-        candidates.append(
-            (
-                int(round(x / scale)),
-                int(round(y / scale)),
-                max(1, int(round(radius / scale))),
-            ),
-        )
-
-    return _remove_duplicate_circles(candidates, config)
-
-
 def _has_scaled_candidate_evidence(
     image: np.ndarray,
     x: int,
@@ -4410,53 +4325,6 @@ def _grid_occupancy(
     return occupied
 
 
-def _refine_bga_grid_from_candidates(
-    candidates: list[tuple[int, int, int]],
-    grid: _BgaGridFit,
-    config: HoughCircleConfig,
-) -> _BgaGridFit:
-    """Nudge fitted grid lines toward nearby candidate centers."""
-    assignments = _assign_candidates_to_grid(candidates, grid, config)
-    x_positions = list(grid.x_positions)
-    y_positions = list(grid.y_positions)
-
-    for column in range(config.expected_grid_cols):
-        values = [
-            float(candidates[index][0])
-            for (row, assigned_column), index in assignments.items()
-            if assigned_column == column
-        ]
-        if len(values) >= config.grid_refine_min_axis_assignments:
-            x_positions[column] = float(np.median(values))
-
-    for row in range(config.expected_grid_rows):
-        values = [
-            float(candidates[index][1])
-            for (assigned_row, column), index in assignments.items()
-            if assigned_row == row
-        ]
-        if len(values) >= config.grid_refine_min_axis_assignments:
-            y_positions[row] = float(np.median(values))
-
-    points = np.array([(x, y) for x, y, _ in candidates], dtype=np.float32)
-    pitch_x = _median_axis_pitch(x_positions, grid.pitch_x)
-    pitch_y = _median_axis_pitch(y_positions, grid.pitch_y)
-    occupied = _grid_occupancy(
-        points=points,
-        x_positions=tuple(x_positions),
-        y_positions=tuple(y_positions),
-        slot_tolerance=max(10.0, min(pitch_x, pitch_y) * config.grid_slot_tolerance_ratio),
-    )
-    return _BgaGridFit(
-        score=grid.score,
-        occupied=occupied,
-        pitch_x=pitch_x,
-        pitch_y=pitch_y,
-        x_positions=tuple(x_positions),
-        y_positions=tuple(y_positions),
-    )
-
-
 def _median_axis_pitch(positions: list[float], fallback: float) -> float:
     """Return the median spacing between sorted grid lines."""
     gaps = np.diff(np.array(sorted(positions), dtype=np.float32))
@@ -4496,71 +4364,6 @@ def _assign_candidates_to_grid(
                 break
 
     return assignments
-
-
-def _build_bga_grid_balls(
-    image: np.ndarray,
-    grid: _BgaGridFit,
-    candidates: list[tuple[int, int, int]],
-    config: HoughCircleConfig,
-) -> tuple[list[SolderBall], list[MissingGridPosition], set[tuple[int, int, int]]]:
-    """Build row-major solder balls from the fitted 16x16 BGA grid."""
-    assignments = _assign_candidates_to_grid(candidates, grid, config)
-    pitch = float((grid.pitch_x + grid.pitch_y) / 2.0)
-    base_radius = max(config.grid_radius_min, int(round(pitch * config.grid_radius_pitch_ratio)))
-    balls: list[SolderBall] = []
-    missing_positions: list[MissingGridPosition] = []
-    assigned_candidates: set[tuple[int, int, int]] = set()
-
-    ball_id = 1
-    for row, y in enumerate(grid.y_positions):
-        for column, x in enumerate(grid.x_positions):
-            center_x = int(round(x))
-            center_y = int(round(y))
-            assignment_index = assignments.get((row, column))
-            confidence = 0.45
-            is_estimated = assignment_index is None
-            if assignment_index is not None:
-                assigned_candidates.add(candidates[assignment_index])
-                confidence = 1.0
-            else:
-                confidence = _grid_slot_evidence_score(
-                    image=image,
-                    x=center_x,
-                    y=center_y,
-                    radius=base_radius,
-                )
-                if confidence < 0.35:
-                    missing_positions.append(
-                        MissingGridPosition(
-                            row=row + 1,
-                            column=column + 1,
-                            center_x=center_x,
-                            center_y=center_y,
-                            reason="no nearby circle candidate / weak local pad evidence",
-                        ),
-                    )
-
-            radius = _estimate_pad_radius(
-                image=image,
-                x=center_x,
-                y=center_y,
-                radius=base_radius,
-                config=config,
-            )
-            balls.append(
-                SolderBall(
-                    ball_id=ball_id,
-                    center_x=center_x,
-                    center_y=center_y,
-                    radius=radius,
-                    confidence=round(confidence, 3),
-                    is_estimated=is_estimated,
-                ),
-            )
-            ball_id += 1
-
-    return balls, missing_positions, assigned_candidates
 
 
 # ---------------------------------------------------------------------------
@@ -4718,41 +4521,6 @@ def _bright_void_evidence_score(
     score = float((area_score + count_score + contrast_score) / 3.0)
     _VOID_SCORE_CACHE[cache_key] = score
     return score
-
-
-def _grid_roi_bounds(
-    image: np.ndarray,
-    grid: _BgaGridFit,
-    config: HoughCircleConfig,
-) -> RoiBounds:
-    """Return a padded ROI around the fitted BGA grid."""
-    height, width = image.shape[:2]
-    margin_x = grid.pitch_x * config.grid_roi_margin_pitch_ratio
-    margin_y = grid.pitch_y * config.grid_roi_margin_pitch_ratio
-    return RoiBounds(
-        x_min=max(0, int(round(grid.x_positions[0] - margin_x))),
-        y_min=max(0, int(round(grid.y_positions[0] - margin_y))),
-        x_max=min(width, int(round(grid.x_positions[-1] + margin_x))),
-        y_max=min(height, int(round(grid.y_positions[-1] + margin_y))),
-    )
-
-
-def _rejected_grid_candidates(
-    candidates: list[tuple[int, int, int]],
-    assigned_candidates: set[tuple[int, int, int]],
-    roi: RoiBounds,
-) -> list[tuple[int, int, int]]:
-    """Return raw candidates not used by the final fitted BGA grid."""
-    rejected = []
-    for candidate in candidates:
-        x, y, _ = candidate
-        if candidate in assigned_candidates:
-            continue
-        if roi.x_min <= x <= roi.x_max and roi.y_min <= y <= roi.y_max:
-            rejected.append(candidate)
-        else:
-            rejected.append(candidate)
-    return rejected
 
 
 def _is_dark_circle(

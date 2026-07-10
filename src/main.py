@@ -249,6 +249,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--save-ball-crops",
+        action="store_true",
+        help=(
+            "Also save the 768 per-ball JPGs (ROI crops + void masks, "
+            "~190 MB per run). Metrics and reports are identical either "
+            "way; these files only serve manual visual debugging."
+        ),
+    )
+
+    parser.add_argument(
         "--jobs",
         type=int,
         default=0,
@@ -474,15 +484,17 @@ def create_output_folders(
     output_root: Path,
     mask_library_root: Path,
     image_stem: str,
+    save_ball_crops: bool = True,
 ) -> dict[str, Path]:
-    """Create all output folders."""
+    """Create output folders (per-ball crop folders only when requested)."""
     folders = {
         "processed": output_root / "Processed",
-        "roi": output_root / "ROI" / image_stem,
-        "masks": output_root / "Masks" / image_stem,
         "reports": output_root / "Reports",
-        "mask_library": mask_library_root / image_stem,
     }
+    if save_ball_crops:
+        folders["roi"] = output_root / "ROI" / image_stem
+        folders["masks"] = output_root / "Masks" / image_stem
+        folders["mask_library"] = mask_library_root / image_stem
 
     for folder in folders.values():
         folder.mkdir(parents=True, exist_ok=True)
@@ -511,6 +523,7 @@ def inspect_image(
     fail_threshold: float,
     largest_void_fail_threshold: float,
     progress_mode: str = "auto",
+    save_ball_crops: bool = False,
 ) -> None:
     """Run complete BGA void inspection for one image."""
     image_path = resolve_path(image_path)
@@ -528,6 +541,17 @@ def inspect_image(
     progress.set_progress(0, "Starting")
     started_at = time.perf_counter()
 
+    # Per-stage wall-clock timing. perf_counter() costs nanoseconds, so the
+    # timer itself never slows the pipeline down.
+    stage_times: list[tuple[str, float]] = []
+    last_mark = started_at
+
+    def mark_stage(label: str) -> None:
+        nonlocal last_mark
+        now = time.perf_counter()
+        stage_times.append((label, now - last_mark))
+        last_mark = now
+
     try:
         # --- Output folders -------------------------------------------------
         try:
@@ -535,6 +559,7 @@ def inspect_image(
                 output_root=output_root,
                 mask_library_root=mask_library_root,
                 image_stem=image_stem,
+                save_ball_crops=save_ball_crops,
             )
         except PermissionError as exc:
             raise PermissionError(
@@ -562,6 +587,7 @@ def inspect_image(
 
         progress.set_progress(8, "Image loaded")
         progress.log(f"[INFO] Image loaded: {raw.shape[1]} x {raw.shape[0]} px")
+        mark_stage("Load")
 
         # --- Preprocessing --------------------------------------------------
         preprocessing_config = PreprocessingConfig()
@@ -572,6 +598,7 @@ def inspect_image(
 
         progress.set_progress(18, "Preprocessing done")
         progress.log("[INFO] Preprocessing completed: CLAHE + Median Filter")
+        mark_stage("Preprocess")
 
         # --- Ball detection -------------------------------------------------
         ball_config = HoughCircleConfig()
@@ -613,6 +640,7 @@ def inspect_image(
         )
 
         progress.set_progress(38, "Debug overlays saved")
+        mark_stage("Ball detection")
 
         # --- Per-ball void segmentation (heaviest stage) --------------------
         void_config = VoidSegmentationConfig()
@@ -686,14 +714,15 @@ def inspect_image(
 
             mask_entries.append((bounds, clean_mask))
 
-            roi_filename = f"{image_stem}_ball_{ball.ball_id:03d}_roi.jpg"
-            mask_filename = f"{image_stem}_ball_{ball.ball_id:03d}_mask.jpg"
+            if save_ball_crops:
+                roi_filename = f"{image_stem}_ball_{ball.ball_id:03d}_roi.jpg"
+                mask_filename = f"{image_stem}_ball_{ball.ball_id:03d}_mask.jpg"
 
-            save_image(folders["roi"] / roi_filename, roi_raw)
-            save_image(folders["masks"] / mask_filename, clean_mask)
+                save_image(folders["roi"] / roi_filename, roi_raw)
+                save_image(folders["masks"] / mask_filename, clean_mask)
 
-            # Dedicated mask library requested for visual validation.
-            save_image(folders["mask_library"] / mask_filename, clean_mask)
+                # Dedicated mask library requested for visual validation.
+                save_image(folders["mask_library"] / mask_filename, clean_mask)
 
             progress.update(
                 per_ball,
@@ -702,6 +731,7 @@ def inspect_image(
 
         progress.set_progress(85, "Void masks complete")
         progress.log("[INFO] Void mask generation completed")
+        mark_stage("Void segmentation")
 
         # --- Annotated outputs ----------------------------------------------
         annotated = annotate_detected_balls(
@@ -728,6 +758,7 @@ def inspect_image(
         )
 
         progress.set_progress(93, "Annotations saved")
+        mark_stage("Annotations")
 
         # --- Summary + reports ----------------------------------------------
         summary = build_summary(
@@ -772,10 +803,18 @@ def inspect_image(
             context=report_context,
         )
 
+        mark_stage("Reports")
         progress.set_progress(100, "Inspection complete")
         progress.finish("Inspection complete")
 
         # --- Final report (printed after the bar has finished) --------------
+        total_seconds = time.perf_counter() - started_at
+        stage_line = " | ".join(
+            f"{label}: {seconds:.1f}s" for label, seconds in stage_times
+        )
+        print(f"\n[TIMING] {stage_line}")
+        print(f"[TIMING] TOTAL: {total_seconds:.1f}s")
+
         print("\n[RESULT] Inspection completed")
         print(f"[RESULT] Image: {image_name}")
         print(f"[RESULT] Balls detected: {len(balls)}")
@@ -793,12 +832,13 @@ def inspect_image(
 
         print("\n[OUTPUT] Processed images:")
         print(f"         {folders['processed']}")
-        print("[OUTPUT] ROI crops:")
-        print(f"         {folders['roi']}")
-        print("[OUTPUT] Result masks:")
-        print(f"         {folders['masks']}")
-        print("[OUTPUT] Dedicated mask library:")
-        print(f"         {folders['mask_library']}")
+        if save_ball_crops:
+            print("[OUTPUT] ROI crops:")
+            print(f"         {folders['roi']}")
+            print("[OUTPUT] Result masks:")
+            print(f"         {folders['masks']}")
+            print("[OUTPUT] Dedicated mask library:")
+            print(f"         {folders['mask_library']}")
         print("[OUTPUT] Reports:")
         print(f"         {folders['reports']}")
         print(f"[OUTPUT] Excel report: {report_paths['excel']}")
@@ -819,6 +859,7 @@ def inspect_folder(
     progress_mode: str = "auto",
     debug: bool = False,
     jobs: int = 1,
+    save_ball_crops: bool = False,
 ) -> None:
     """Run inspection for all supported images in a folder.
 
@@ -846,6 +887,7 @@ def inspect_folder(
         progress_mode=progress_mode,
         debug=debug,
         jobs=jobs,
+        save_ball_crops=save_ball_crops,
     )
 
 
@@ -865,7 +907,15 @@ def _batch_worker(args: tuple) -> tuple[str, str, str | None]:
         warning_threshold,
         fail_threshold,
         largest_void_fail_threshold,
+        save_ball_crops,
     ) = args
+
+    # One image per worker: OpenCV's internal thread pool would otherwise
+    # oversubscribe the CPU (workers x threads), slowing everyone down.
+    # Thread count does not affect any numeric result, only scheduling.
+    import cv2
+
+    cv2.setNumThreads(1)
 
     buffer = io.StringIO()
     error: str | None = None
@@ -879,6 +929,7 @@ def _batch_worker(args: tuple) -> tuple[str, str, str | None]:
                 fail_threshold=fail_threshold,
                 largest_void_fail_threshold=largest_void_fail_threshold,
                 progress_mode="off",
+                save_ball_crops=save_ball_crops,
             )
     except Exception as exc:  # noqa: BLE001 - reported to the parent process
         error = str(exc)
@@ -893,6 +944,7 @@ def _run_batch_parallel(
     fail_threshold: float,
     largest_void_fail_threshold: float,
     jobs: int,
+    save_ball_crops: bool = False,
 ) -> tuple[int, list[tuple[Path, Exception]]]:
     """Process independent images in parallel worker processes.
 
@@ -910,6 +962,7 @@ def _run_batch_parallel(
             warning_threshold,
             fail_threshold,
             largest_void_fail_threshold,
+            save_ball_crops,
         )
         for path in image_paths
     ]
@@ -955,6 +1008,7 @@ def inspect_image_batch(
     progress_mode: str = "auto",
     debug: bool = False,
     jobs: int = 1,
+    save_ball_crops: bool = False,
 ) -> None:
     """Run inspection for a list of images, continuing past per-image errors."""
     total = len(image_paths)
@@ -974,6 +1028,7 @@ def inspect_image_batch(
             fail_threshold=fail_threshold,
             largest_void_fail_threshold=largest_void_fail_threshold,
             jobs=min(jobs, total),
+            save_ball_crops=save_ball_crops,
         )
         print("\n" + "=" * 80)
         print(
@@ -997,6 +1052,7 @@ def inspect_image_batch(
                 fail_threshold=fail_threshold,
                 largest_void_fail_threshold=largest_void_fail_threshold,
                 progress_mode=progress_mode,
+                save_ball_crops=save_ball_crops,
             )
             succeeded += 1
         except KeyboardInterrupt:
@@ -1064,6 +1120,7 @@ def _run(args: argparse.Namespace) -> None:
             progress_mode=args.progress,
             debug=args.debug,
             jobs=args.jobs,
+            save_ball_crops=args.save_ball_crops,
         )
         return
 
@@ -1076,6 +1133,7 @@ def _run(args: argparse.Namespace) -> None:
             fail_threshold=args.fail_threshold,
             largest_void_fail_threshold=args.largest_void_fail_threshold,
             progress_mode=args.progress,
+            save_ball_crops=args.save_ball_crops,
         )
         return
 
@@ -1090,6 +1148,7 @@ def _run(args: argparse.Namespace) -> None:
             progress_mode=args.progress,
             debug=args.debug,
             jobs=args.jobs,
+            save_ball_crops=args.save_ball_crops,
         )
         return
 
