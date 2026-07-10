@@ -1,2 +1,0 @@
-image_name,total_balls,average_void_ratio_percent,maximum_void_ratio_percent,median_void_ratio_percent,max_single_void_ratio_percent,balls_over_warning_threshold,warning_threshold_percent,ipc_a610_defect_balls,ipc_7095_process_indicator_balls,ipc_verdict,standards_applied,qualitative_verdict,fail_threshold_percent,largest_void_fail_threshold_percent,balls_pass,balls_review,balls_fail,balls_estimated_pads
-PCBA1_10.jpg,256,2.8638,10.6732,2.4701,7.8123,4,10.0,0,4,ACCEPT WITH PROCESS INDICATORS,IPC-A-610 / IPC-7095,REVIEW,25.0,12.25,252,4,0,0
